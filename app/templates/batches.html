@@ -21,7 +21,7 @@
     <div class="table-wrap">
       <table class="grid" data-sortable>
         <thead>
-          <tr><th>批次</th><th>运行号</th><th>来源</th><th>水位</th><th class="num">已应用</th><th class="num">重复</th><th class="num">冲突</th><th class="num">隔离</th><th class="num">迟到</th><th class="num">快照键</th><th>对账</th><th>输入摘要</th></tr>
+          <tr><th>批次</th><th>运行号</th><th>来源</th><th>状态</th><th>水位</th><th class="num">已应用</th><th class="num">重复</th><th class="num">冲突</th><th class="num">隔离</th><th class="num">暂缓</th><th class="num">迟到</th><th class="num">快照键</th><th>对账</th><th>输入摘要</th></tr>
         </thead>
         <tbody>
           {% for row in batches %}
@@ -29,11 +29,13 @@
             <td class="mono">{{ row.batch_id }}</td>
             <td class="mono ellipsis" title="{{ row.run_id }}">{{ row.run_id | masked(18) }}</td>
             <td>{{ row.source }}</td>
+            <td>{{ row.status | status }}</td>
             <td class="mono nowrap">{{ row.watermark_utc | localdt }}</td>
             <td class="num">{{ row.counters.applied | num }}</td>
             <td class="num">{{ row.counters.duplicates | num }}</td>
             <td class="num">{{ row.counters.conflicts | num }}</td>
             <td class="num">{{ row.counters.quarantine | num }}</td>
+            <td class="num">{{ row.counters.held | num }}</td>
             <td class="num">{{ row.counters.late_events | num }}</td>
             <td class="num">{{ row.counters.snapshot_keys | num }}</td>
             <td><span class="balance {% if not row.reconcile_ok %}is-bad{% endif %}">{{ "平" if row.reconcile_ok else "不平" }}</span></td>
@@ -58,6 +60,7 @@
       <dl class="kv">
         <dt>批次</dt><dd>{{ batch.batch_id }}</dd>
         <dt>运行号</dt><dd>{{ batch.run_id }}</dd>
+        <dt>状态</dt><dd>{{ batch.status | status }}</dd>
         <dt>批次键</dt><dd>{{ batch.batch_key }}</dd>
         <dt>输入摘要</dt><dd>{{ batch.input_digest }}</dd>
         <dt>水位</dt><dd>{{ batch.watermark_utc | localdt }}</dd>
@@ -68,6 +71,7 @@
       <div class="actions" style="margin-top:10px">
         <button class="btn btn-primary" id="btn-resume" type="button" data-batch="{{ batch.batch_id }}">续跑</button>
         <a class="btn" href="/api/batches/{{ batch.batch_id }}/manifest">运行清单</a>
+        <a class="btn" href="/audit?batch_id={{ batch.batch_id }}">核对</a>
       </div>
       <p class="hint" id="resume-hint">{{ plan.reason }}</p>
       {% else %}

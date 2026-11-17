@@ -30,6 +30,7 @@ def rows(store, limit: int = 30) -> list[dict]:
                 "duplicates": _int(totals.get("duplicates")),
                 "conflicts": _int(totals.get("conflicts")),
                 "quarantine": _int(totals.get("quarantine")),
+                "held": _int(totals.get("held")),
                 "late_events": _int(totals.get("late_events")),
                 "snapshot_keys": _int(totals.get("snapshot_keys")),
             },

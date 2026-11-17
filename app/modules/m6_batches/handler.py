@@ -56,6 +56,8 @@ def api_resume(batch_id: str, ctx: Ctx = Depends(get_ctx)) -> dict:
         "reconciliation": result["reconciliation"],
         "all_balanced": result["all_balanced"],
         "watermark": result["watermark"],
+        "publish": result.get("publish"),
+        "held": result.get("held", []),
         "stages": result["stages"],
     }
 

@@ -1,8 +1,12 @@
-"""去重与冲突编排：按显式优先级把事件分成 已应用 / 重复 / 冲突 / 隔离。
+"""去重与冲突编排：按显式优先级把事件分成 已应用 / 重复 / 冲突 / 隔离 / 暂缓。
 
 判定顺序（优先级）固定，且每一步都是集合运算，不依赖输入顺序：
 
-    quarantine（契约不通过） > conflict（版本冲突/墓碑复活） > duplicate（同签名） > apply
+    quarantine（契约不通过） > held（时间超前参考时钟） > conflict（版本冲突/墓碑复活）
+    > duplicate（同签名） > apply
+
+`held` 在冲突判定之前分流：被挡下的未来时间不参与去重与冲突，既不会伪造冲突，
+也不会把同一键的正常版本整组拖进冲突表。
 """
 from __future__ import annotations
 
@@ -12,7 +16,7 @@ from ... import config, reasons
 from ..m2_schema.service import Norm, distribution
 from . import conflict, dedup
 
-PRIORITY = ("quarantine", "conflict", "duplicate", "apply")
+PRIORITY = ("quarantine", "held", "conflict", "duplicate", "apply")
 
 
 @dataclass
@@ -21,6 +25,7 @@ class Classification:
     duplicates: list[Norm] = field(default_factory=list)
     conflicts: list[Norm] = field(default_factory=list)
     quarantine: list[Norm] = field(default_factory=list)
+    held: list[Norm] = field(default_factory=list)
     detail_of: dict[int, str] = field(default_factory=dict)
     ref_of: dict[int, str] = field(default_factory=dict)
 
@@ -31,17 +36,19 @@ class Classification:
             "duplicates": len(self.duplicates),
             "conflicts": len(self.conflicts),
             "quarantine": len(self.quarantine),
+            "held": len(self.held),
             "total": (len(self.applied) + len(self.duplicates)
-                      + len(self.conflicts) + len(self.quarantine)),
+                      + len(self.conflicts) + len(self.quarantine)
+                      + len(self.held)),
         }
 
     @property
     def all_rows(self) -> list[Norm]:
-        return sorted(self.applied + self.duplicates + self.conflicts + self.quarantine,
-                      key=lambda n: n.seq)
+        return sorted(self.applied + self.duplicates + self.conflicts
+                      + self.quarantine + self.held, key=lambda n: n.seq)
 
 
-def classify(norms: list[Norm]) -> Classification:
+def classify(norms: list[Norm], hold=None) -> Classification:
     ordered = sorted(norms, key=lambda n: n.seq)
     result = Classification()
 
@@ -51,7 +58,19 @@ def classify(norms: list[Norm]) -> Classification:
         norm.reason_code = norm.errors[0]
         result.detail_of[norm.seq] = norm.detail or reasons.label(norm.reason_code)
     result.quarantine = quarantine
-    live = [n for n in ordered if not n.errors]
+    clean = [n for n in ordered if not n.errors]
+
+    held: list[Norm] = []
+    if hold is not None:
+        held = [n for n in clean if hold.blocks(n)]
+        for norm in held:
+            norm.row_class = "held"
+            norm.reason_code = "W_FUTURE_HELD"
+            norm.detail = hold.detail_of.get(norm.seq, reasons.label("W_FUTURE_HELD"))
+            result.detail_of[norm.seq] = norm.detail
+        result.held = sorted(held, key=lambda n: n.seq)
+    held_seqs = {n.seq for n in held}
+    live = [n for n in clean if n.seq not in held_seqs]
 
     in_conflict = conflict.version_conflicts(live)
     conflict_seqs = {n.seq for n in in_conflict}
@@ -116,6 +135,7 @@ def rule_table() -> list[dict]:
     """页面上展示的优先级表（判定顺序而非业务描述）。"""
     labels = {
         "quarantine": "契约不通过（字段/类型/必填）",
+        "held": "时间超前参考时钟，整条暂缓",
         "conflict": "同版本不同内容 / 墓碑后低版本",
         "duplicate": "同签名重复到达",
         "apply": "按版本升序应用",

@@ -6,7 +6,9 @@
 - 金额一律 Decimal，单位「元」，最小刻度 0.01，禁止 float 累加；
 - 水位线 = 已应用事件的最大 event_time − 迟到窗口；
 - 迟到判定为半开区间：event_time < 水位线 记迟到，等于水位线不算迟到；
-- 快照窗口：含等号一侧 [.., as_of]，待定窗口为半开 (as_of, +inf)，两窗口不重叠。
+- 快照窗口：含等号一侧 [.., as_of]，待定窗口为半开 (as_of, +inf)，两窗口不重叠；
+- 时钟保护：event_time > 参考时刻 + 超前容差 的记录判「暂缓」（held），不进水位、
+  不进正式快照，只在核对页列证据；等参考时钟追上后重新采信即可放行。
 """
 from __future__ import annotations
 
@@ -20,12 +22,16 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CHINA_TZ = dt.timezone(dt.timedelta(hours=8), "Asia/Shanghai")
 UTC = dt.timezone.utc
 
-RULE_VERSION = "cdcwater/1.0.0"
+RULE_VERSION = "cdcwater/1.1.0"
 DECIMAL_QUANT = Decimal("0.01")
 MONEY_UNIT = "元"
 
 # 迟到窗口：水位线 = 已应用事件最大 event_time − 该窗口
 LATE_WINDOW_MINUTES = 10
+
+# 时钟保护：event_time 超前参考时刻超过该容差 → 暂缓（源库时钟错乱的典型征兆）。
+# 容差内的「轻微超前」仍按正常事件应用，避免把跨日到达/传输延迟误伤。
+FUTURE_TOLERANCE_MINUTES = 10
 
 STAGES = ("ingest", "contract", "dedup", "watermark", "snapshot", "export")
 STAGE_LABELS = {
@@ -122,6 +128,10 @@ class Settings:
     sample_dir: str = str(PROJECT_ROOT / "sample_data")
     rule_version: str = RULE_VERSION
     late_window_minutes: int = LATE_WINDOW_MINUTES
+    future_tolerance_minutes: int = FUTURE_TOLERANCE_MINUTES
+    # 参考时钟。None 表示用本次运行的 UTC 墙钟；测试/回放可固定成字符串，
+    # 保证「未来时间」判定可复算、不随执行时刻漂移。
+    reference_now: str | None = None
     seed_on_start: bool = True
     export_dir: str = str(PROJECT_ROOT / "var" / "export")
 
@@ -134,14 +144,49 @@ class Settings:
         minutes = base.late_window_minutes
         if window.strip():
             minutes = int(window)
+        tolerance = os.getenv("CDCWATER_FUTURE_TOLERANCE") or ""
+        tolerance_minutes = base.future_tolerance_minutes
+        if tolerance.strip():
+            tolerance_minutes = int(tolerance)
+        reference = os.getenv("CDCWATER_REFERENCE_NOW") or None
         seed = os.getenv("CDCWATER_SEED")
         seed_on_start = base.seed_on_start if seed is None else seed.strip() not in ("0", "false", "no")
         return replace(cls(), db_path=db_path, sample_dir=sample_dir,
-                       late_window_minutes=minutes, seed_on_start=seed_on_start)
+                       late_window_minutes=minutes,
+                       future_tolerance_minutes=tolerance_minutes,
+                       reference_now=reference,
+                       seed_on_start=seed_on_start)
 
     @property
     def late_window(self) -> dt.timedelta:
         return dt.timedelta(minutes=self.late_window_minutes)
+
+    @property
+    def future_tolerance(self) -> dt.timedelta:
+        return dt.timedelta(minutes=self.future_tolerance_minutes)
+
+    def reference_time(self) -> dt.datetime:
+        """参考时刻（UTC）：固定值优先，否则取本次运行的墙钟。
+
+        固定值写错不静默回退——时钟保护的口径必须可复算，写错就拒绝运行。
+        """
+        text = (self.reference_now or "").strip()
+        if text:
+            body = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+            try:
+                value = dt.datetime.fromisoformat(body)
+            except ValueError as exc:
+                from . import errors
+
+                raise errors.BadRequest(
+                    f"参考时刻 {text!r} 不是合法 ISO8601",
+                    code="E_BAD_REFERENCE",
+                    detail={"value": text,
+                            "hint": "例：2026-11-15T09:10:00Z"}) from exc
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=UTC)
+            return value.astimezone(UTC)
+        return dt.datetime.now(UTC)
 
     @property
     def data_dir(self) -> Path:

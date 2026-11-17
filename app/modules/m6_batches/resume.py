@@ -14,11 +14,12 @@ from . import state
 
 
 def replay_of(store, batch_key: str) -> dict | None:
-    found = store.find_done_by_key(batch_key)
+    found = store.find_replayable_by_key(batch_key)
     if not found:
         return None
     return {"batch_id": found["batch_id"], "run_id": found["run_id"],
             "watermark_utc": found.get("watermark_utc"),
+            "status": found.get("status"),
             "code": "B_IDEMPOTENT_REPLAY"}
 
 
@@ -29,9 +30,16 @@ def plan(store, batch_id: str) -> dict:
     latest = store.latest_batch()
     stages = store.load_stages(batch_id)
     failed = [s for s in stages if s["status"] == "failed"]
-    if batch["status"] == "done":
+    if batch["status"] in ("done", "held_only", "empty_only"):
+        code = {"done": "B_IDEMPOTENT_REPLAY", "held_only": "B_HELD_ONLY",
+                "empty_only": "B_EMPTY_KEEP_SNAPSHOT"}[batch["status"]]
+        reason = {
+            "done": "批次已完成，重跑走幂等重放",
+            "held_only": "批次全部暂缓，正式快照未变；参考时钟追上后重跑即可放行",
+            "empty_only": "本次没有可应用事件，正式快照未变；确认导出后重新采信",
+        }[batch["status"]]
         return {"batch_id": batch_id, "can_resume": False,
-                "reason": "批次已完成，重跑走幂等重放", "code": "B_IDEMPOTENT_REPLAY",
+                "reason": reason, "code": code,
                 "from_stage": None, "watermark_utc": batch.get("watermark_utc"),
                 "is_latest": latest is not None and latest["batch_id"] == batch_id}
     if latest is not None and latest["batch_id"] != batch_id:

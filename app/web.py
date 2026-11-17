@@ -26,6 +26,7 @@ NAV = (
     ("/conflicts", "冲突隔离", "conflicts"),
     ("/snapshot", "快照", "snapshot"),
     ("/batches", "批次", "batches"),
+    ("/audit", "核对", "audit"),
 )
 
 ROW_CLASS_LABELS = {
@@ -33,9 +34,12 @@ ROW_CLASS_LABELS = {
     "duplicate": "重复",
     "conflict": "冲突",
     "quarantine": "隔离",
+    "held": "暂缓",
 }
 SNAPSHOT_LABELS = {"active": "活跃", "tombstone": "墓碑", "pending": "待定"}
-STATUS_LABELS = {"done": "完成", "failed": "失败", "running": "运行中", "stale": "已拒绝"}
+STATUS_LABELS = {"done": "已发布", "failed": "失败", "running": "运行中",
+                 "held_only": "全部暂缓", "empty_only": "空结果未发布",
+                 "stale": "已拒绝"}
 
 
 @dataclass
@@ -44,9 +48,14 @@ class Ctx:
     store: object
 
     def current_batch(self, batch_id: str | None = None) -> dict | None:
+        """页面上的「当前批次」= 最新一次尝试（含暂缓/失败）。
+
+        证据页要能看到最近一次被挡下的记录；正式快照由 `latest_published()`
+        单独取，两者不能混。
+        """
         if batch_id:
             return self.store.get_batch(batch_id)
-        return self.store.latest_batch()
+        return self.store.latest_any()
 
     def layers(self, batch_id: str) -> dict:
         """一次取齐页面需要的只读数据，避免每页各写一套查询。"""

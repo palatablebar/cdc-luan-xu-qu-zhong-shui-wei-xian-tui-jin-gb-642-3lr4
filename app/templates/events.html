@@ -15,6 +15,12 @@
       <a href="/events?table={{ name }}" {% if table == name %}aria-current="true"{% endif %}>{{ name }}</a>
       {% endfor %}
     </div>
+    {% if held_count %}
+    <p class="hint is-warn" style="margin-top:8px">
+      {{ held_count }} 条记录时间超前参考时钟，判为「暂缓」：不进水位与正式快照，
+      逐条明细见 <a href="/audit">核对</a>。
+    </p>
+    {% endif %}
   </div>
   <div class="panel-body tight">
     <div class="table-wrap">

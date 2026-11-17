@@ -16,10 +16,11 @@ docker compose exec -T app python -m pytest -q
 ## 2 主流程（页面）
 
 1. `/` 水位时间轴 → 选来源 → 点「采信」；
-2. `/events` 按分类筛选，确认每行的行号引用与原因码；
+2. `/events` 按分类筛选，确认每行的行号引用与原因码（含「暂缓」分类）；
 3. `/conflicts` 看冲突分组与隔离区，导出隔离 CSV；
 4. `/snapshot` 点「物化」，核对三条对账；
-5. `/batches` 看 `run_id`、输入 sha256 与阶段耗时，导出运行清单。
+5. `/batches` 看 `run_id`、输入 sha256 与阶段耗时，导出运行清单；
+6. `/audit` 看正式快照归属、被挡下的记录与落库核对。
 
 ## 3 主流程（命令）
 
@@ -29,6 +30,7 @@ curl -s -X POST $BASE/api/events/import -H 'content-type: application/json' -d '
 curl -s "$BASE/api/conflicts" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["counters"])'
 curl -s "$BASE/api/watermark"  | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["watermark"])'
 curl -s -X POST $BASE/api/snapshot | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["rows"], d["amounts"])'
+curl -s "$BASE/api/audit"   | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["publish"], d["held_count"], d["audit"]["consistent"])'
 curl -s -o /tmp/events.csv      "$BASE/api/export/events.csv"
 curl -s -o /tmp/quarantine.csv  "$BASE/api/export/quarantine.csv"
 curl -s -o /tmp/conflicts.csv   "$BASE/api/export/conflicts.csv"
@@ -46,8 +48,21 @@ curl -s -o /tmp/manifest.json   "$BASE/api/export/manifest.json"
 | 隔离区大量同名行 | `E_COLUMN_COUNT` / `E_BAD_JSON` | 导出端截断或多分隔符，重新导出 |
 | 冲突表出现同键同版本 | `C_VERSION_CONFLICT` | 两条都不应用，回源确认版本号 |
 | 导入报 409 | `C_STALE_BATCH` | 拿到的是旧导出，重新导出后再跑 |
+| 水位不前进、快照像已封板 | `W_FUTURE_HELD` | 打开 `/audit`：被挡记录逐条列出；确认是时钟错乱就回源修正导出，确属正常跨日就等参考时钟追上后重跑 |
+| 整批未发布 / 正式快照没变 | `B_HELD_ONLY` | 本批全被暂缓，正式快照保持上一版；核对 `/audit` 后重跑 |
+| 空文件导致未发布 | `B_EMPTY_KEEP_SNAPSHOT` | 导出读成 0 行，旧快照保留；确认文件后重新采信 |
+| 采信或续跑失败 | `B_FAILED_KEEP_SNAPSHOT` | 旧正式快照保留；按失败阶段续跑 |
+| `/audit` 提示落库不一致 | `E_RECOVERY_MISMATCH` | 恢复中断可能丢行；重算已被拒绝，重新采信该来源或从备份恢复 |
 | 快照键比预期少 | `W_PENDING_WINDOW` | 事件落在水位之后，等下一轮水位推过 |
 | 水位不前进 | `W_WATERMARK_REGRESS` | 检查导出端时钟与文件版本 |
+
+### 4.1 时钟错乱处置顺序
+
+1. 打开 `/audit`，看「被挡下的记录」：行号引用、事件时间、原始时间、超前时长一应俱全；
+2. 若确认是源库时钟错乱：回源修正导出，重新采信；
+3. 若确认是正常跨日数据：等参考时钟追上（或显式传 `CDCWATER_REFERENCE_NOW` 指向更晚时刻）
+   后重跑同一来源，核对页会把该条标为「可放行」，重跑后进新批次，不重复入库；
+4. 不要手工改库：落库核对会在下次重算时把差异暴露出来。
 
 ## 5 重建数据库
 

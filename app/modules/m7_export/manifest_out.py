@@ -15,6 +15,7 @@ def build(store, batch_id: str) -> dict:
         "run_id": doc.get("run_id") or batch.get("run_id"),
         "batch_id": batch_id,
         "batch_key": batch.get("batch_key"),
+        "status": batch.get("status"),
         "rule_version": config.RULE_VERSION,
         "timezone": "入库 UTC，页面按 Asia/Shanghai(+08:00)",
         "money": "金额 Decimal，单位元，最小刻度 0.01",
@@ -27,6 +28,9 @@ def build(store, batch_id: str) -> dict:
         "watermark_utc": doc.get("watermark_utc") or batch.get("watermark_utc"),
         "max_event_time_utc": doc.get("max_event_time_utc")
         or batch.get("max_event_time"),
+        "reference_utc": doc.get("reference_utc"),
+        "future_horizon_utc": doc.get("future_horizon_utc"),
+        "future_tolerance_minutes": doc.get("future_tolerance_minutes"),
         "stages": doc.get("stages", _stages(store, batch_id)),
         "counters": doc.get("counters", store.load_totals(batch_id)),
         "reconcile": doc.get("reconcile", []),

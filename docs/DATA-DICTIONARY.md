@@ -43,12 +43,30 @@
 
 ## 5 水位线与窗口（关键定义）
 
-- **水位线** = 已应用事件的最大 `event_time` − 10 分钟。只由已应用事件推进：重复、冲突、
-  隔离都不推进。
+- **参考时刻**：本次运行的参考时钟。默认取运行时的 UTC 墙钟；可用参数 `reference_now`
+  （环境变量 `CDCWATER_REFERENCE_NOW`）固定成 ISO8601 时刻以复算同一结果。
+- **时钟容差**：`future_tolerance_minutes`（默认 10，环境变量 `CDCWATER_FUTURE_TOLERANCE`）。
+- **暂缓（held）**：`event_time > 参考时刻 + 容差` → `W_FUTURE_HELD`。整条记录不应用：
+  不推进水位、不进正式快照、不参与去重与冲突判定，只在事件表与核对页留证据。
+  等于容差线照常应用（与半开口径一致）。参考时钟追上后重新采信即放行。
+- **水位线** = 已应用事件的最大 `event_time` − 10 分钟，且**不超过参考时刻**（上限只压水位，
+  不改事件本身的迟到比较口径）。只由已应用事件推进：重复、冲突、隔离、暂缓都不推进。
 - **迟到**：`event_time < 水位线` 判迟到（`W_LATE_ARRIVAL`），**但仍然应用**；等于水位线不算迟到。
 - **快照窗口**：`event_time ≤ as_of`，`as_of` = 本次水位线。含等号一侧。
 - **待定窗口**：`(as_of, +inf)`，半开。两窗口互不重叠、合起来覆盖全部已应用事件。
 - 同一键既有快照内事件、又有待定事件时，快照取 `≤ as_of` 的最大版本，并记 `drift`。
+
+## 5.1 发布裁决
+
+| 条件 | 批次状态 | 正式快照 |
+|---|---|---|
+| 有已应用事件 | `done` | 本批快照即正式快照（暂缓记录不参与） |
+| 全部记录被暂缓 | `held_only` | **保持上一版**，不写空快照 |
+| 无可应用事件且已有正式快照 | `empty_only` | **保持上一版**（恢复中断常表现为读成 0 行） |
+| 运行失败 | `failed` | 保持上一版；失败不降级 `done` 批次 |
+
+「正式快照」= 状态为 `done` 的最新批次。页面、`/api/snapshot`、快照导出与清单都以它为准；
+`held_only` / `empty_only` / `failed` 只提供证据，供核对页复核。
 
 ## 6 去重键与冲突
 
@@ -58,7 +76,8 @@
 - **版本冲突** `C_VERSION_CONFLICT`：同键同版本出现两种以上签名 → 整组不应用。
 - **墓碑复活** `C_TOMBSTONE_RESURRECT`：某键存在版本 `d` 的 `delete`，之后到达的 `version < d`
   的 `upsert` 不应用；删除之前到达的低版本照常应用（会被删除覆盖，结果一致）。
-- **优先级**：`quarantine > conflict > duplicate > apply`，判定由集合运算得出，与遍历顺序无关。
+- **优先级**：`quarantine > held > conflict > duplicate > apply`，判定由集合运算得出，与遍历顺序无关。
+  暂缓在冲突之前分流，所以未来时间不会伪造冲突、也不会把同一键的正常版本拖进冲突表。
 
 ## 7 空态三态
 
@@ -77,6 +96,8 @@
 | `duplicates` | 同签名重复到达（保留首条） |
 | `conflicts` | 版本冲突 + 墓碑复活 |
 | `quarantine` | 契约不通过（字段、类型、必填、表名、时间、截断、列数） |
+| `held` | 时间超前参考时钟、整条暂缓的记录（不进水位/快照，证据保留） |
+| `held_amount` | 暂缓记录金额合计（仅展示，不进任何正式合计） |
 | `keys_total` | 有已应用事件的键 |
 | `snapshot_keys` | 进快照的键（含墓碑） |
 | `active_keys` / `tombstone_keys` | 快照内活跃 / 墓碑 |
@@ -86,8 +107,21 @@
 ## 9 运行清单字段
 
 `run_id`（`CDC-时间戳-随机`）、`batch_id`（`B-批次键`）、`batch_key`（输入摘要 + 规则版本 +
-参数 的 sha256 前 10 位）、`input_digest`（每个文件 `name:sha256` 的摘要）、`inputs[]`
-（`name/bytes/sha256/lines/encoding/kind/declared_rows/status/code`）、`params`、
-`watermark_utc`、`max_event_time_utc`、`stages[]`、`counters`、`reconcile`。
+参数 + 规则参数 + 暂缓集合签名 的 sha256 前 10 位）、`input_digest`（每个文件 `name:sha256` 的摘要）、
+`inputs[]`（`name/bytes/sha256/lines/encoding/kind/declared_rows/status/code`）、`params`、
+`watermark_utc`、`max_event_time_utc`、`reference_utc`、`future_horizon_utc`、`stages[]`、
+`counters`、`reconcile`。
 
-同一 `input_digest` 重跑命中同一 `batch_key`，返回原批次、不新增行。
+同一 `input_digest` 且暂缓集合不变时重跑命中同一 `batch_key`，返回原批次、不新增行；
+参考时钟追上导致放行记录时暂缓集合改变，会按新结果落成新批次（旧批次保留证据）。
+
+## 10 落库核对（`/api/audit`）
+
+| 字段 | 含义 |
+|---|---|
+| `official` | 正式快照所属批次（最新 `status=done`） |
+| `attempt` | 最新一次尝试（可能 `held_only` / `failed`） |
+| `held[]` | 被暂缓的记录：行号引用、键、事件时间、原始时间、超前时长、可放行标记 |
+| `releasable_count` | 按当前参考时刻已可放行的条数（重跑即放行） |
+| `audit.consistent` | 落库核对结论；不一致为 `E_RECOVERY_MISMATCH` |
+| `audit.snapshot.missing/extra/changed` | 与「按已落库事件重算」相比的差异键 |

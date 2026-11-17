@@ -9,23 +9,28 @@ import json
 import time
 from decimal import Decimal
 
-from ... import config, errors, manifest as manifest_mod, reasons
+from ... import config, manifest as manifest_mod, reasons
 from ..m1_events import service as m1_service
 from ..m2_schema import service as m2_service
 from ..m3_dedup import service as m3_service
+from ..m4_watermark import future as future_mod
 from ..m4_watermark import watermark as wm_mod
 from ..m5_snapshot import materialize, service as m5_service
 from ..m5_snapshot import apply as apply_mod
+from ..m8_audit import publish as publish_mod
 from . import history, resume, state
 
 
 COUNT_KEYS = ("files", "raw_lines", "blank_lines", "header_repeat", "applied",
-              "duplicates", "conflicts", "quarantine", "late_events",
-              "on_time_events", "max_behind_minutes", "keys_total",
+              "duplicates", "conflicts", "quarantine", "held",
+              "late_events", "on_time_events", "max_behind_minutes", "keys_total",
               "snapshot_keys", "active_keys", "tombstone_keys",
               "pending_only_keys", "pending_events", "drift_keys")
-AMOUNT_KEYS = ("amount_snapshot", "amount_pending", "amount_drift", "amount_applied")
-TIME_KEYS = ("watermark_utc", "max_event_time", "snapshot_as_of")
+AMOUNT_KEYS = ("amount_snapshot", "amount_pending", "amount_drift", "amount_applied",
+               "held_amount")
+TIME_KEYS = ("watermark_utc", "max_event_time", "snapshot_as_of",
+             "reference_utc", "future_horizon_utc")
+UNPUBLISHED = publish_mod.UNPUBLISHED
 
 
 def public_totals(totals: dict) -> dict:
@@ -67,6 +72,8 @@ def run(*, settings, store, source: str = "all", params: dict | None = None,
     run_id = manifest_mod.new_run_id()
     params = state.normalize_params(params)
     stages: list[dict] = []
+    reference = settings.reference_time()
+    tolerance = settings.future_tolerance
 
     # ---- M1 采信 ----
     step = time.perf_counter()
@@ -78,12 +85,6 @@ def run(*, settings, store, source: str = "all", params: dict | None = None,
                          elapsed_ms=_ms(step),
                          note=f"{counts['files']} 个文件 / 空行 {counts['blank_lines']}"))
 
-    key = state.batch_key(bundle.input_digest, settings.rule_version, params)
-    batch_id = state.batch_id_for(key)
-    replay = resume.replay_of(store, key)
-    if replay is not None:
-        return _replay_payload(store, replay, key, run_id, stages)
-
     # ---- M2 契约 ----
     step = time.perf_counter()
     norms = m2_service.normalize_rows(bundle.rows)
@@ -92,24 +93,41 @@ def run(*, settings, store, source: str = "all", params: dict | None = None,
                          quarantine=len(bad), elapsed_ms=_ms(step),
                          note="别名映射 + 类型归一 + UTC"))
 
+    # ---- M4 时钟保护（在去重冲突之前分流，未来时间不参与冲突判定） ----
+    # 暂缓集合决定批次键：参考时钟追上后放行记录，结果不同，必须算新批次。
+    step = time.perf_counter()
+    hold = future_mod.plan(norms, reference, tolerance)
+
+    rule_params = {"late_window_minutes": settings.late_window_minutes,
+                   "future_tolerance_minutes": settings.future_tolerance_minutes}
+    key = state.batch_key(bundle.input_digest, settings.rule_version, params,
+                          rule_params, hold_signature=hold.signature)
+    batch_id = state.batch_id_for(key)
+    replay = resume.replay_of(store, key)
+    if replay is not None:
+        return _replay_payload(store, replay, key, run_id, stages)
+
     # ---- M3 去重冲突 ----
     step = time.perf_counter()
-    classified = m3_service.classify(norms)
-    stages.append(_stage("dedup", in_count=len(norms) - len(bad),
+    classified = m3_service.classify(norms, hold=hold)
+    stages.append(_stage("dedup", in_count=len(norms) - len(bad) - len(classified.held),
                          out_count=len(classified.applied),
                          quarantine=len(classified.duplicates) + len(classified.conflicts),
                          elapsed_ms=_ms(step),
                          note=f"重复 {len(classified.duplicates)} / 冲突 "
-                              f"{len(classified.conflicts)}"))
+                              f"{len(classified.conflicts)} / 暂缓 {len(classified.held)}"
+                              f"（超前参考 {settings.future_tolerance_minutes} 分钟）"))
 
-    # ---- M4 水位与迟到（先打迟到标记，再折叠成应用事件） ----
+    # ---- M4 水位与迟到（正式水位 = 已应用事件最大 event_time − 窗口，且不超过参考时钟） ----
     step = time.perf_counter()
-    marks = wm_mod.advance(classified.applied, settings.late_window)
+    marks = wm_mod.advance(classified.applied, settings.late_window,
+                           ceiling=reference)
     applied = [apply_mod.Applied.from_norm(n) for n in classified.applied]
     iso = lambda value: _iso(value)  # noqa: E731
     stages.append(_stage("watermark", in_count=len(applied), out_count=len(applied),
                          quarantine=0, elapsed_ms=_ms(step),
-                         note=f"迟到 {marks.late} / 窗口 {settings.late_window_minutes} 分钟"))
+                         note=f"迟到 {marks.late} / 窗口 {settings.late_window_minutes} 分钟"
+                              + (" / 上限参考时钟" if marks.capped else "")))
 
     max_event = _iso(marks.max_event_time)
     resume.ensure_not_stale(store, max_event)
@@ -119,12 +137,14 @@ def run(*, settings, store, source: str = "all", params: dict | None = None,
     snapshot = materialize.materialize(applied, marks.final)
     rows_ok = (counts["data_lines"]
                == len(classified.applied) + len(classified.duplicates)
-               + len(classified.conflicts) + len(classified.quarantine))
+               + len(classified.conflicts) + len(classified.quarantine)
+               + len(classified.held))
     reconcile = [
         {"name": "行账", "kind": "count", "left": "原始行", "left_value": counts["data_lines"],
-         "right": "已应用 + 重复 + 冲突 + 隔离",
+         "right": "已应用 + 重复 + 冲突 + 隔离 + 暂缓",
          "right_value": (len(classified.applied) + len(classified.duplicates)
-                         + len(classified.conflicts) + len(classified.quarantine)),
+                         + len(classified.conflicts) + len(classified.quarantine)
+                         + len(classified.held)),
          "ok": rows_ok},
         *materialize.reconcile(snapshot),
     ]
@@ -144,6 +164,9 @@ def run(*, settings, store, source: str = "all", params: dict | None = None,
         "duplicates": len(classified.duplicates),
         "conflicts": len(classified.conflicts),
         "quarantine": len(classified.quarantine),
+        "held": len(classified.held),
+        "held_amount": sum((n.amount for n in classified.held
+                            if n.amount is not None), Decimal("0.00")),
         "late_events": marks.late,
         "on_time_events": marks.on_time,
         "max_behind_minutes": marks.max_behind_seconds // 60,
@@ -161,6 +184,8 @@ def run(*, settings, store, source: str = "all", params: dict | None = None,
         "amount_applied": snapshot.amounts["applied"],
         "watermark_utc": _iso(marks.final),
         "max_event_time": max_event,
+        "reference_utc": _iso(reference),
+        "future_horizon_utc": _iso(hold.horizon),
         "reconcile_ok": 1 if all(r["ok"] for r in reconcile) else 0,
         "reconcile_json": json.dumps(_jsonable(reconcile), ensure_ascii=False),
     }
@@ -171,12 +196,17 @@ def run(*, settings, store, source: str = "all", params: dict | None = None,
                          out_count=len(snapshot.rows), quarantine=0, elapsed_ms=0,
                          note="证据行 / 隔离 / 冲突 / 快照 / 清单"))
 
+    decision = publish_mod.decide(classified, snapshot,
+                                  has_official=store.latest_published() is not None)
+    status = decision.status
     batch = {
         "batch_id": batch_id, "batch_key": key, "run_id": run_id,
-        "source": bundle.source, "status": "done", "created_at": started_at,
+        "source": bundle.source, "status": status, "created_at": started_at,
         "finished_at": finished_at, "input_digest": bundle.input_digest,
         "watermark_utc": _iso(marks.final), "max_event_time": max_event,
-        "params": params, "note": _batch_note(resume_of, marks.late), "replay_of": resume_of,
+        "params": params,
+        "note": _batch_note(resume_of, marks.late, len(classified.held), decision),
+        "replay_of": resume_of,
     }
     doc = manifest_mod.build(
         run_id=run_id, batch_id=batch_id, batch_key=key, settings=settings,
@@ -188,7 +218,10 @@ def run(*, settings, store, source: str = "all", params: dict | None = None,
                 for s in stages],
         counters={k: str(v) for k, v in totals.items() if k != "reconcile_json"},
         watermark=_iso(marks.final) or "", max_event_time=max_event or "",
-        reconcile=_jsonable(reconcile))
+        reconcile=_jsonable(reconcile),
+        reference_utc=_iso(reference) or "",
+        future_horizon_utc=_iso(hold.horizon) or "",
+        status=status)
 
     snapshot_rows = [{**row, "amount": None if row["amount"] is None else str(row["amount"])}
                      for row in snapshot.rows]
@@ -201,12 +234,13 @@ def run(*, settings, store, source: str = "all", params: dict | None = None,
         stages=stages, totals=totals, manifest=doc)
 
     return {
-        "status": "done",
+        "status": status,
         "batch": batch,
         "batch_key": key,
         "run_id": run_id,
         "idempotent_replay": False,
         "replay_of": resume_of,
+        "publish": _publish_payload(store, batch, decision),
         "stages": [{**s, "label": config.STAGE_LABELS.get(s["stage"], s["stage"])}
                    for s in stages],
         "totals": public_totals(totals),
@@ -218,9 +252,24 @@ def run(*, settings, store, source: str = "all", params: dict | None = None,
             "late": marks.late, "on_time": marks.on_time,
             "window_minutes": settings.late_window_minutes,
             "max_behind_minutes": marks.max_behind_seconds // 60,
+            "reference": _iso(reference), "horizon": _iso(hold.horizon),
+            "capped": marks.capped,
         },
+        "held": hold.rows,
         "inputs": [_input_row(f) for f in bundle.files],
         "elapsed_ms": elapsed,
+    }
+
+
+def _publish_payload(store, batch: dict, decision) -> dict:
+    official = publish_mod.official(store)
+    return {
+        "status": batch.get("status"),
+        "published": decision.published,
+        "code": decision.code,
+        "note": decision.note,
+        "official_batch_id": official["batch_id"] if official else None,
+        "official_watermark": official.get("watermark_utc") if official else None,
     }
 
 
@@ -229,14 +278,26 @@ def _replay_payload(store, replay: dict, key: str, run_id: str,
     batch = store.get_batch(replay["batch_id"]) or {}
     totals = store.load_totals(replay["batch_id"])
     reconcile = json.loads(totals.get("reconcile_json") or "[]")
+    official = publish_mod.official(store)
     return {
-        "status": "done",
+        "status": batch.get("status") or "done",
         "batch": batch,
         "batch_key": key,
         "run_id": batch.get("run_id", run_id),
         "idempotent_replay": True,
         "replay_of": replay["batch_id"],
         "note": reasons.label("B_IDEMPOTENT_REPLAY"),
+        "publish": {
+            "status": batch.get("status"),
+            "published": publish_mod.is_published(batch),
+            "code": None if publish_mod.is_published(batch) else (
+                "B_HELD_ONLY" if batch.get("status") == "held_only"
+                else "B_EMPTY_KEEP_SNAPSHOT" if batch.get("status") == "empty_only"
+                else "B_IDEMPOTENT_REPLAY"),
+            "note": reasons.label("B_IDEMPOTENT_REPLAY"),
+            "official_batch_id": official["batch_id"] if official else None,
+            "official_watermark": official.get("watermark_utc") if official else None,
+        },
         "stages": store.load_stages(replay["batch_id"]),
         "totals": public_totals(totals),
         "counters": {
@@ -244,6 +305,7 @@ def _replay_payload(store, replay: dict, key: str, run_id: str,
             "duplicates": int(totals.get("duplicates", 0) or 0),
             "conflicts": int(totals.get("conflicts", 0) or 0),
             "quarantine": int(totals.get("quarantine", 0) or 0),
+            "held": int(totals.get("held", 0) or 0),
             "total": int(totals.get("raw_lines", 0) or 0),
         },
         "reconciliation": reconcile,
@@ -251,7 +313,13 @@ def _replay_payload(store, replay: dict, key: str, run_id: str,
         "watermark": {"final": batch.get("watermark_utc"),
                       "max_event_time": batch.get("max_event_time"),
                       "late": int(totals.get("late_events", 0) or 0),
-                      "on_time": int(totals.get("on_time_events", 0) or 0)},
+                      "on_time": int(totals.get("on_time_events", 0) or 0),
+                      "reference": totals.get("reference_utc"),
+                      "horizon": totals.get("future_horizon_utc")},
+        "held": [{"row_ref": r["row_ref"], "event_time": r["event_time_utc"],
+                  "table": r["table_name"], "pk": r["pk"], "version": r["version"],
+                  "detail": r["detail"]}
+                 for r in store.load_events(replay["batch_id"], "held")],
         "inputs": store.load_inputs(replay["batch_id"]),
         "elapsed_ms": 0,
     }
@@ -261,11 +329,39 @@ def resume_batch(*, settings, store, batch_id: str) -> dict:
     plan = resume.plan(store, batch_id)
     batch = store.get_batch(batch_id) or {}
     params = json.loads(batch.get("params_json") or "{}")
-    result = run(settings=settings, store=store, source=batch.get("source") or "all",
-                 params=params, resume_of=batch_id)
+    previous = publish_mod.official(store)
+    try:
+        result = run(settings=settings, store=store, source=batch.get("source") or "all",
+                     params=params, resume_of=batch_id)
+    except Exception as exc:  # noqa: BLE001 - 失败只记状态，旧快照保持原样
+        _record_failure(store, batch, exc)
+        raise
     result["resume_plan"] = plan
     result["resume_note"] = resume.resume_note(plan)
+    result["publish"]["official_before"] = (previous or {}).get("batch_id")
     return result
+
+
+def _record_failure(store, batch: dict, exc: Exception) -> None:
+    """失败尝试落成 failed：只写批次与输入，不动任何已发布结果行。
+
+    `save_attempt` 对已发布（done）批次不降级，所以就算续跑失败也不会把
+    上一版正式快照的来源批次改成失败。
+    """
+    note = f"{reasons.label('B_FAILED_KEEP_SNAPSHOT')}：{type(exc).__name__}"
+    store.save_attempt(
+        batch={
+            "batch_id": batch.get("batch_id") or "B-unknown",
+            "batch_key": batch.get("batch_key") or "unknown",
+            "run_id": manifest_mod.new_run_id(),
+            "source": batch.get("source") or "all",
+            "status": "failed", "created_at": _now_iso(),
+            "finished_at": _now_iso(),
+            "input_digest": batch.get("input_digest") or "",
+            "params": json.loads(batch.get("params_json") or "{}"),
+        },
+        inputs=store.load_inputs(batch.get("batch_id") or ""),
+        note=note)
 
 
 def _input_row(item) -> dict:
@@ -276,12 +372,16 @@ def _input_row(item) -> dict:
             "code": item.code, "note": item.note}
 
 
-def _batch_note(resume_of: str | None, late: int) -> str:
+def _batch_note(resume_of: str | None, late: int, held: int, decision=None) -> str:
     parts = []
     if resume_of:
         parts.append("续跑")
     if late:
         parts.append(f"迟到 {late}")
+    if held:
+        parts.append(f"暂缓 {held}")
+    if decision is not None and not decision.published:
+        parts.append("未发布")
     return " · ".join(parts)
 
 

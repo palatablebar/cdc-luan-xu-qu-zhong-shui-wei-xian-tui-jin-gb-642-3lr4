@@ -35,6 +35,8 @@ def api_import(payload: dict | None = None, ctx: Ctx = Depends(get_ctx)) -> dict
         "reconciliation": result["reconciliation"],
         "all_balanced": result["all_balanced"],
         "watermark": result["watermark"],
+        "publish": result.get("publish"),
+        "held": result.get("held", []),
         "inputs": result["inputs"],
     }
 
@@ -59,7 +61,8 @@ def api_events(row_class: str | None = None, table: str | None = None,
             "schema": r["schema_version"], "class": r["row_class"],
             "reason_code": r["reason_code"],
             "amount": None if r["amount"] is None else str(r["amount"]),
-            "late": r["late"], "detail": r["detail"],
+            "late": r["late"], "held": r["row_class"] == "held",
+            "detail": r["detail"],
         } for r in rows],
     }
 
@@ -72,6 +75,7 @@ def page_events(request: Request, row_class: str | None = None,
         "inputs": [], "events": [], "snapshot": [], "watermarks": [],
         "stages": [], "totals": {}}
     events = layers["events"]
+    held_count = sum(1 for e in events if e["row_class"] == "held")
     if row_class:
         events = [e for e in events if e["row_class"] == row_class]
     if table:
@@ -80,6 +84,7 @@ def page_events(request: Request, row_class: str | None = None,
                   events=events[:400], total_events=len(layers["events"]),
                   inputs=layers["inputs"], totals=layers["totals"],
                   row_class=row_class or "", table=table or "",
+                  held_count=held_count,
                   table_list=sorted({e["table_name"] for e in layers["events"]
                                      if e["table_name"]}),
                   page_title="事件流")

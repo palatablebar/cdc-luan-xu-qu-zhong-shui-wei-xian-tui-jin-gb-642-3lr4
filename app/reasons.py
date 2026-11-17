@@ -71,6 +71,9 @@ REASONS = {
     "E_BAD_TIME": _r(
         "E_BAD_TIME", ERROR, "contract",
         "event_time 无法解析为时刻", "检查是否混入 25 点、斜杠日期或空值"),
+    "E_BAD_REFERENCE": _r(
+        "E_BAD_REFERENCE", ERROR, "contract",
+        "参考时刻无法解析", "参考时刻要写成 UTC ISO8601，例 2026-11-15T09:10:00Z"),
     "E_BAD_SCHEMA": _r(
         "E_BAD_SCHEMA", ERROR, "contract",
         "schema 版本未登记", "先补别名映射再采信"),
@@ -112,6 +115,10 @@ REASONS = {
     "W_LATE_ARRIVAL": _r(
         "W_LATE_ARRIVAL", WARN, "watermark",
         "event_time 早于水位线，迟到但仍应用", "已进快照，核对是否漏掉补数窗口"),
+    "W_FUTURE_HELD": _r(
+        "W_FUTURE_HELD", WARN, "watermark",
+        "event_time 超前参考时钟，整条暂缓：不推进水位、不进正式快照",
+        "多为源库时钟错乱；等参考时钟追上后，用新的参考时刻重新采信放行"),
     "W_WATERMARK_REGRESS": _r(
         "W_WATERMARK_REGRESS", WARN, "watermark",
         "本次最大 event_time 低于已持久化水位，水位不回退", "确认是否重放了旧文件"),
@@ -122,6 +129,10 @@ REASONS = {
     "S_TOMBSTONE": _r(
         "S_TOMBSTONE", INFO, "snapshot",
         "该键最新版本是删除，快照留墓碑", "墓碑参与去重，不出现在活跃行"),
+    "E_RECOVERY_MISMATCH": _r(
+        "E_RECOVERY_MISMATCH", ERROR, "snapshot",
+        "落库快照/事件与已采信内容不一致（恢复中断可能丢了记录）",
+        "重新从原始导出采信，或从备份恢复该批次的快照行"),
     # ---- M6 批次 ----
     "B_IDEMPOTENT_REPLAY": _r(
         "B_IDEMPOTENT_REPLAY", INFO, "batches",
@@ -132,6 +143,15 @@ REASONS = {
     "B_NO_STATE": _r(
         "B_NO_STATE", WARN, "batches",
         "该批次没有可用的断点状态，按全新批次重跑", "失败过早时会遇到"),
+    "B_HELD_ONLY": _r(
+        "B_HELD_ONLY", WARN, "batches",
+        "本批记录全部暂缓，正式快照保持上一版", "等参考时钟追上后重新采信放行"),
+    "B_EMPTY_KEEP_SNAPSHOT": _r(
+        "B_EMPTY_KEEP_SNAPSHOT", WARN, "batches",
+        "本次没有可应用事件，正式快照保持上一版", "确认导出是否读成空文件，必要时重新导出"),
+    "B_FAILED_KEEP_SNAPSHOT": _r(
+        "B_FAILED_KEEP_SNAPSHOT", WARN, "batches",
+        "本次运行失败，已保留上一版正式快照", "按失败阶段续跑；旧快照未被覆盖"),
     "C_STALE_BATCH": _r(
         "C_STALE_BATCH", ERROR, "batches",
         "输入最大 event_time 低于已持久化水位，按陈旧批次拒绝", "确认导出端时钟与文件版本"),

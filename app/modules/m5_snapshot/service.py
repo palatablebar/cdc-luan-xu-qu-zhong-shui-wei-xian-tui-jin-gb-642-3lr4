@@ -1,10 +1,19 @@
-"""快照编排：从已应用事件重建、落库、给页面/导出提供行。"""
+"""快照编排：从已应用事件重建、落库、给页面/导出提供行。
+
+两个安全闸门：
+
+1. 只有正式（`done`）批次才允许重算落库；`held_only` / `failed` 批次只留证据，
+   不能顶掉上一版正式快照；
+2. 落库前先核对「已采信内容 vs 已落库快照」，不一致（恢复中断可能丢记录）就拒绝，
+   旧快照原样保留，由核对页给出差异。
+"""
 from __future__ import annotations
 
 from decimal import Decimal
 
-from ... import config
+from ... import config, errors
 from ..m2_schema.coerce import iso_utc, parse_iso
+from ..m8_audit import verify
 from . import apply as apply_mod
 from . import materialize
 
@@ -19,6 +28,10 @@ def as_of_of(store, batch_id: str):
     return parse_iso(batch.get("watermark_utc"))
 
 
+def official_batch(store) -> dict | None:
+    return store.latest_published()
+
+
 def build(store, batch_id: str) -> materialize.Snapshot:
     events = applied_events(store, batch_id)
     as_of = as_of_of(store, batch_id)
@@ -28,7 +41,25 @@ def build(store, batch_id: str) -> materialize.Snapshot:
 
 
 def rebuild(store, batch_id: str) -> materialize.Snapshot:
-    """可重复调用：同一 as_of 重算快照，行数不变、合计不变。"""
+    """可重复调用：同一 as_of 重算快照，行数不变、合计不变。
+
+    非正式批次（`held_only` / `failed`）与核对不一致的批次一律拒绝，
+    保证「恢复失败时保留旧版正式快照」。
+    """
+    batch = store.get_batch(batch_id) or {}
+    status = batch.get("status")
+    if status and status != "done":
+        official = official_batch(store)
+        code = {"held_only": "B_HELD_ONLY",
+                "empty_only": "B_EMPTY_KEEP_SNAPSHOT"}.get(
+                    status, "B_FAILED_KEEP_SNAPSHOT")
+        raise errors.Conflict(
+            "该批次不是正式批次，正式快照保持上一版",
+            code=code,
+            detail={"batch_id": batch_id, "status": status,
+                    "official_batch_id": official["batch_id"] if official else None,
+                    "official_watermark": (official or {}).get("watermark_utc")})
+    verify.ensure_consistent(store, batch_id)
     snapshot = build(store, batch_id)
     totals = snapshot.totals()
     store.replace_snapshot(batch_id, snapshot.rows, totals)

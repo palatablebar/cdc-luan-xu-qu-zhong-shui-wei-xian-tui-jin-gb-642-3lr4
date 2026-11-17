@@ -17,15 +17,19 @@ router = APIRouter(tags=["M4 水位与迟到"])
 def api_watermark(ctx: Ctx = Depends(get_ctx)) -> dict:
     batch = ctx.current_batch()
     if batch is None:
-        return {"batch_id": None, "watermark": None, "ticks": [], "late_rows": []}
+        return {"batch_id": None, "watermark": None, "ticks": [], "late_rows": [],
+                "held": []}
     return {
         "batch_id": batch["batch_id"],
         "watermark": service.summary(ctx.store, batch["batch_id"]),
         "ticks": service.timeline(ctx.store, batch["batch_id"]),
         "advance": service.advance_points(ctx.store, batch["batch_id"]),
         "late_rows": service.late_table(ctx.store, batch["batch_id"]),
+        "held": service.held_rows(ctx.store, batch["batch_id"]),
+        "reference": service.reference_of(ctx.store, batch["batch_id"]),
         "window": service.window_rows(),
         "window_minutes": ctx.settings.late_window_minutes,
+        "tolerance_minutes": ctx.settings.future_tolerance_minutes,
     }
 
 
@@ -33,6 +37,8 @@ def api_watermark(ctx: Ctx = Depends(get_ctx)) -> dict:
 def page_home(request: Request, batch_id: str | None = None,
               ctx: Ctx = Depends(get_ctx)):
     batch = ctx.current_batch(batch_id)
+    official = ctx.store.latest_published()
+    attempted_published = bool(batch and batch.get("status") == "done")
     layers = ctx.layers(batch["batch_id"]) if batch else {
         "inputs": [], "events": [], "snapshot": [], "watermarks": [],
         "stages": [], "totals": {}}
@@ -40,7 +46,7 @@ def page_home(request: Request, batch_id: str | None = None,
     reconcile = json.loads(totals.get("reconcile_json") or "[]")
     timeline = service.timeline(ctx.store, batch["batch_id"]) if batch else {
         "ticks": [], "final": None, "max": None, "min": None,
-        "late_window": ctx.settings.late_window_minutes}
+        "late_window": ctx.settings.late_window_minutes, "held": []}
     recent = sorted(layers["events"], key=lambda r: -r["seq"])[:10]
     return render(request, "index.html", batch=batch, page="watermark",
                   totals=totals, stages=layers["stages"], inputs=layers["inputs"],
@@ -51,8 +57,17 @@ def page_home(request: Request, batch_id: str | None = None,
                   timeline=timeline,
                   late_rows=service.late_table(ctx.store, batch["batch_id"])[:6]
                   if batch else [],
+                  held_rows=service.held_rows(ctx.store, batch["batch_id"])
+                  if batch else [],
+                  reference=service.reference_of(ctx.store, batch["batch_id"])
+                  if batch else {"reference": None, "horizon": None, "held": 0},
+                  official=official,
+                  attempted_published=attempted_published,
+                  official_watermark=(official or {}).get("watermark_utc"),
                   window_rows=service.window_rows(),
+                  clock_rows=service.clock_rows(ctx.settings.future_tolerance_minutes),
                   reconcile=reconcile,
                   batch_list=history_mod.rows(ctx.store, limit=6),
                   late_window=ctx.settings.late_window_minutes,
+                  tolerance_minutes=ctx.settings.future_tolerance_minutes,
                   page_title="水位时间轴")

@@ -1,9 +1,13 @@
-"""水位页编排：把落库的水位序列还原成时间轴刻度与迟到表。"""
+"""水位页编排：把落库的水位序列还原成时间轴刻度与迟到表。
+
+暂缓（held）记录不在水位序列里（它们不推进水位），单独从事件表取出，供首页
+与水位页在「水位」之外并列展示，说明为什么水位没有跟着未来时间跳。
+"""
 from __future__ import annotations
 
 from ... import config
 from ..m2_schema.coerce import parse_iso
-from . import late, watermark
+from . import late
 
 
 def _rows(store, batch_id: str) -> list[dict]:
@@ -15,7 +19,7 @@ def summary(store, batch_id: str) -> dict:
     if not rows:
         return {"final": None, "max_event_time": None, "late": 0, "on_time": 0,
                 "total": 0, "late_rate": 0.0, "worst_behind_minutes": 0,
-                "boundary_note": ""}
+                "boundary_note": "", "held": held_count(store, batch_id)}
     final = max(r["watermark_utc"] for r in rows)
     max_event = max(r["event_time_utc"] for r in rows)
     marks = [r["watermark_utc"] for r in rows]
@@ -32,6 +36,36 @@ def summary(store, batch_id: str) -> dict:
         "late_rate": round(len(late_rows) / len(rows), 4) if rows else 0.0,
         "worst_behind_minutes": late.minutes(worst),
         "boundary_note": "event_time 严格小于水位线才算迟到",
+        "held": held_count(store, batch_id),
+    }
+
+
+def held_count(store, batch_id: str) -> int:
+    return len(store.load_events(batch_id, "held"))
+
+
+def held_rows(store, batch_id: str) -> list[dict]:
+    """被挡下的记录：核对页的简版，放在水位页说明「水位为何没跳」。"""
+    out = []
+    for row in store.load_events(batch_id, "held"):
+        out.append({
+            "row_ref": row["row_ref"],
+            "table": row["table_name"], "pk": row["pk"],
+            "version": row["version"], "op": row["op"],
+            "event_time": row["event_time_utc"],
+            "event_time_raw": row["event_time_raw"],
+            "reason_code": row["reason_code"] or "W_FUTURE_HELD",
+            "detail": row["detail"],
+        })
+    return sorted(out, key=lambda r: r["event_time"] or "")
+
+
+def reference_of(store, batch_id: str) -> dict:
+    totals = store.load_totals(batch_id)
+    return {
+        "reference": totals.get("reference_utc"),
+        "horizon": totals.get("future_horizon_utc"),
+        "held": int(totals.get("held", 0) or 0),
     }
 
 
@@ -39,7 +73,7 @@ def timeline(store, batch_id: str) -> dict:
     rows = _rows(store, batch_id)
     if not rows:
         return {"ticks": [], "final": None, "max": None, "min": None,
-                "late_window": config.LATE_WINDOW_MINUTES}
+                "late_window": config.LATE_WINDOW_MINUTES, "held": []}
     events = [parse_iso(r["event_time_utc"]) for r in rows]
     marks = [parse_iso(r["watermark_utc"]) for r in rows]
     ticks = []
@@ -52,6 +86,8 @@ def timeline(store, batch_id: str) -> dict:
             "behind": row["behind_seconds"],
         })
     final = max(marks)
+    held = [{"ref": row["row_ref"], "event": row["event_time"]}
+            for row in held_rows(store, batch_id)]
     return {
         "ticks": ticks,
         "final": final.isoformat() if final else None,
@@ -60,6 +96,7 @@ def timeline(store, batch_id: str) -> dict:
         "late_window": config.LATE_WINDOW_MINUTES,
         "late": sum(1 for r in rows if r["late"]),
         "on_time": sum(1 for r in rows if not r["late"]),
+        "held": held,
     }
 
 
@@ -95,3 +132,7 @@ def advance_points(store, batch_id: str) -> list[dict]:
 
 def window_rows() -> list[dict]:
     return late.window_table(config.LATE_WINDOW_MINUTES)
+
+
+def clock_rows(tolerance_minutes: int) -> list[dict]:
+    return late.clock_table(config.LATE_WINDOW_MINUTES, tolerance_minutes)

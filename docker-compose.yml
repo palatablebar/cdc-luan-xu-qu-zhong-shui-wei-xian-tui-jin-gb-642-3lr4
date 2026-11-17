@@ -6,6 +6,7 @@ services:
       CDCWATER_DB: /data/cdcwater.sqlite
       CDCWATER_SAMPLE_DIR: /app/sample_data
       CDCWATER_LATE_WINDOW: "10"
+      CDCWATER_FUTURE_TOLERANCE: "${CDCWATER_FUTURE_TOLERANCE:-10}"
       CDCWATER_SEED: "${CDCWATER_SEED:-1}"
       TZ: Asia/Shanghai
     ports:

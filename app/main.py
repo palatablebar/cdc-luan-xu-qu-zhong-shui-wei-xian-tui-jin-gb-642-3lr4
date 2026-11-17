@@ -19,9 +19,10 @@ from .modules.m4_watermark import handler as m4_handler
 from .modules.m5_snapshot import handler as m5_handler
 from .modules.m6_batches import handler as m6_handler
 from .modules.m7_export import handler as m7_handler
+from .modules.m8_audit import handler as m8_handler
 
 MODULES = (m1_handler, m2_handler, m3_handler, m4_handler, m5_handler,
-           m6_handler, m7_handler)
+           m6_handler, m7_handler, m8_handler)
 
 
 def create_app(settings: config.Settings | None = None,
@@ -54,17 +55,27 @@ def create_app(settings: config.Settings | None = None,
     @app.get("/api/health", include_in_schema=False)
     def health() -> dict:
         store = app.state.store
-        batch = store.latest_batch()
-        totals = store.load_totals(batch["batch_id"]) if batch else {}
+        attempt = store.latest_any()
+        official = store.latest_published()
+        totals = store.load_totals(attempt["batch_id"]) if attempt else {}
         return {
             "status": "ok",
             "rule_version": settings.rule_version,
             "late_window_minutes": settings.late_window_minutes,
-            "batch_id": batch["batch_id"] if batch else None,
-            "watermark_utc": batch.get("watermark_utc") if batch else None,
+            "future_tolerance_minutes": settings.future_tolerance_minutes,
+            # 当前尝试（含暂缓/失败）与正式快照分开报，调用方不会把空快照当已发布
+            "batch_id": attempt["batch_id"] if attempt else None,
+            "batch_status": attempt.get("status") if attempt else None,
+            "official_batch_id": official["batch_id"] if official else None,
+            "official_watermark_utc": official.get("watermark_utc") if official else None,
+            "watermark_utc": official.get("watermark_utc") if official else None,
             "events": int(totals.get("raw_lines", 0) or 0),
             "applied": int(totals.get("applied", 0) or 0),
-            "snapshot_keys": int(totals.get("snapshot_keys", 0) or 0),
+            "held": int(totals.get("held", 0) or 0),
+            "snapshot_keys": int(totals.get("snapshot_keys", 0) or 0)
+            if attempt and attempt.get("status") == "done" else
+            int((store.load_totals(official["batch_id"]) if official else {})
+                .get("snapshot_keys", 0) or 0),
         }
 
     @app.exception_handler(KeyError)

@@ -72,6 +72,19 @@
       lane.appendChild(mark);
     });
 
+    /* 暂缓记录不推进水位：画成描边刻度，越界的一律贴右端并注明。 */
+    (data.held || []).forEach(function (item) {
+      var at = parseTime(item.event);
+      if (at === null) return;
+      var mark = document.createElement("span");
+      mark.className = "tl-event is-held";
+      var beyond = at > end;
+      mark.style.left = pct(at) + "%";
+      mark.title = item.ref + " · " + label(at) + " · 暂缓"
+        + (beyond ? "（超前参考时钟，已贴边显示）" : "");
+      lane.appendChild(mark);
+    });
+
     if (finalMark !== null) {
       var line = document.createElement("span");
       line.className = "tl-mark";

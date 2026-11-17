@@ -1,12 +1,17 @@
 # 深度登记 cdcwater（CDC 乱序去重与水位线推进）
 
-- 规模：中型（7 个功能模块 / 7 个页面 / 79 条测试）
+- 规模：中型（8 个功能模块 / 7 个页面 / 102 条测试）
 - 核心规则一：**版本序折叠 + 墓碑**——每个 `(table, pk)` 按 `version` 升序应用，`delete` 写墓碑；
   同键同版本出现两种内容整组不应用（`C_VERSION_CONFLICT`），删除之后到达的低版本 upsert
   不复活（`C_TOMBSTONE_RESURRECT`），删除之前到达的低版本照常应用后被覆盖。
-- 核心规则二：**水位线与半开窗口**——水位线 = 已应用事件最大 `event_time` − 10 分钟，单调
-  不回退；`event_time < 水位线` 记迟到但**仍然应用**；快照取 `event_time ≤ as_of`，
+- 核心规则二：**水位线与半开窗口**——水位线 = 已应用事件最大 `event_time` − 10 分钟，且不超过
+  参考时刻，单调不回退；`event_time < 水位线` 记迟到但**仍然应用**；快照取 `event_time ≤ as_of`，
   待定窗口 `(as_of, +inf)` 半开，两窗口不重叠也不留缝。
+- 核心规则三：**时钟保护与发布裁决**——`event_time > 参考 + 容差`（默认 10 分钟）的记录整条
+  暂缓（`W_FUTURE_HELD`），不进水位、不进正式快照、不参与冲突；有正常数据就正常发布，
+  全部暂缓时批次为 `held_only`、正式快照保持上一版；参考时钟追上后重新采信即放行。
+- 核心规则四：**落库核对**——`/audit` 把「已采信事件」重算成快照，与已落库快照逐键比对；
+  恢复中断丢行时判 `E_RECOVERY_MISMATCH`，拒绝重算并保留旧正式快照。
 - 使用者与工作流：订单库 CDC 管道负责人，每天收 3 个导出文件（主表、旧列名补数、迟到补丁），
   原先靠 grep 日志判断「这条到底应用了没有」；现在一次采信即可得到水位、迟到清单、冲突与
   隔离明细，以及可导出复核的快照与运行清单。
@@ -18,10 +23,11 @@
 | M1 事件采信 | 选来源跑一次采信，看逐文件诊断与行号 | POST /api/events/import、页面 /events | `app/modules/m1_events/reader.py` `app/modules/m1_events/decode.py` `app/modules/m1_events/format.py` `app/modules/m1_events/service.py` | `tests/test_m1_events.py` |
 | M2 契约兼容 | 看字段契约与别名，试归一一条事件 | GET /api/schema、POST /api/schema/preview、页面 /schema | `app/modules/m2_schema/contract.py` `app/modules/m2_schema/coerce.py` `app/modules/m2_schema/alias.py` `app/modules/m2_schema/service.py` | `tests/test_m2_schema.py` |
 | M3 去重冲突 | 看重复、冲突、隔离与优先级 | GET /api/conflicts、页面 /conflicts | `app/modules/m3_dedup/dedup.py` `app/modules/m3_dedup/conflict.py` `app/modules/m3_dedup/service.py` | `tests/test_m3_dedup.py` |
-| M4 水位迟到 | 看水位时间轴与迟到明细 | GET /api/watermark、页面 / | `app/modules/m4_watermark/watermark.py` `app/modules/m4_watermark/late.py` `app/modules/m4_watermark/service.py` | `tests/test_m4_watermark.py` |
+| M4 水位迟到 | 看水位时间轴、迟到明细与暂缓记录 | GET /api/watermark、页面 / | `app/modules/m4_watermark/watermark.py` `app/modules/m4_watermark/future.py` `app/modules/m4_watermark/late.py` `app/modules/m4_watermark/service.py` | `tests/test_m4_watermark.py` |
 | M5 快照物化 | 按水位物化快照，看待定键与三条对账 | POST /api/snapshot、页面 /snapshot | `app/modules/m5_snapshot/apply.py` `app/modules/m5_snapshot/materialize.py` `app/modules/m5_snapshot/service.py` | `tests/test_m5_snapshot.py` |
 | M6 批次续跑 | 查历史、看运行清单、续跑与重跑 | GET /api/batches、POST /api/batches/{id}/resume、页面 /batches | `app/modules/m6_batches/state.py` `app/modules/m6_batches/resume.py` `app/modules/m6_batches/history.py` `app/modules/m6_batches/service.py` | `tests/test_m6_batches.py` |
 | M7 审计导出 | 下载证据行、隔离、冲突、快照与清单 | GET /api/export/* | `app/modules/m7_export/csv_out.py` `app/modules/m7_export/json_out.py` `app/modules/m7_export/manifest_out.py` `app/modules/m7_export/service.py` | `tests/test_m7_export.py` |
+| M8 发布核对 | 看正式快照归属、被挡下的记录、仍可发布的数据 | GET /api/audit、页面 /audit | `app/modules/m8_audit/publish.py` `app/modules/m8_audit/verify.py` `app/modules/m8_audit/service.py` | `tests/test_m8_audit.py` |
 
 端到端：`tests/test_e2e.py` 覆盖「样例 → 采信 → 归一 → 去重冲突 → 水位 → 快照 → 导出 → 页面」，
 含 4xx 失败输入与幂等重跑；`tests/test_invariants.py` 覆盖行账、键账、金额、幂等、迟到互补。
@@ -41,16 +47,22 @@
 | TRAP-19 | 一条事件同时像「重复」又像「冲突」，坏行还互相重复 | 按代码书写顺序覆盖，结果随遍历顺序变 | 优先级 `quarantine > conflict > duplicate > apply`，各桶由集合运算得出 | `app/modules/m3_dedup/service.py` | `tests/test_m3_dedup.py::test_conflict_beats_duplicate`、`tests/test_m3_dedup.py::test_priority_independent_of_input_order` |
 | TRAP-23 | 事件 `event_time` 恰好等于水位线 / 恰好等于 `as_of` | 两端都算，重复计入或漏计 | 迟到用半开 `[水位线, +inf)`；快照含 `as_of`、待定窗口 `(as_of, +inf)` 半开 | `app/modules/m4_watermark/watermark.py`、`app/modules/m5_snapshot/materialize.py` | `tests/test_m4_watermark.py::test_boundary_equal_watermark_is_not_late`、`tests/test_m5_snapshot.py::test_boundary_event_at_as_of_included_once` |
 | TRAP-26 | 拿上一轮旧导出再跑一次（最大事件 06:00 < 已持久化水位 08:52） | 无条件覆盖，水位回退、快照变旧 | 陈旧批次直接 409 `C_STALE_BATCH`，已落库结果不动 | `app/modules/m6_batches/resume.py`、`app/modules/m6_batches/state.py` | `tests/test_m6_batches.py::test_stale_input_rejected` |
+| TRAP-27 | 同一份导出混入源库时钟错乱的未来时间（11-16 的记录混进 11-15） | 水位一次跳到未来，后续正常变更全变成迟到，快照像当天已封板 | 超前参考超过容差的记录整条暂缓（`W_FUTURE_HELD`），不进水位/快照/冲突；正常数据照常发布 | `app/modules/m4_watermark/future.py`、`app/modules/m6_batches/service.py` | `tests/test_m8_audit.py::test_future_event_does_not_advance_watermark_or_snapshot` |
+| TRAP-28 | 为了挡未来时间，干脆把整批记录丢弃 | 确实跨日到达的补数被一起漏掉，且无证据可查 | 暂缓只挡该条，其余照常发布；被挡记录逐条留证据并在 `/audit` 列出、参考追上后可放行 | `app/modules/m8_audit/service.py`、`app/modules/m4_watermark/future.py` | `tests/test_m8_audit.py::test_releasable_detected_by_audit` |
+| TRAP-29 | 一批全是未来时间（或运行失败）被写成空快照 | 用空快照覆盖已发布的正式快照，下游当天数据全丢 | 状态 `held_only` / `failed` 不发布，正式快照保持上一版；重算非正式批次返回 409 | `app/modules/m8_audit/publish.py`、`app/modules/m5_snapshot/service.py` | `tests/test_m8_audit.py::test_all_held_keeps_official_snapshot` |
+| TRAP-30 | 恢复中断丢了快照行，三条对账却可能刚好自洽 | 核对结果与已采信内容不一致却无人发现 | `/audit` 用已落库事件重算快照并逐键比对，缺失/多出/变更显式列出；不一致拒绝重算、保留旧快照 | `app/modules/m8_audit/verify.py` | `tests/test_m8_audit.py::test_audit_detects_missing_snapshot_rows` |
 
 ## 对账规则
 
-- **行账**：原始数据行 = 已应用 + 重复 + 冲突 + 隔离（空行与注释行单独计数）；
+- **行账**：原始数据行 = 已应用 + 重复 + 冲突 + 隔离 + 暂缓（空行与注释行单独计数）；
 - **键账**：已应用键 = 快照键 + 只有待定事件的键；快照键 = 活跃键 + 墓碑键；
 - **金额账**：快照金额 + 待定金额 + 变化金额 = 已应用金额（Decimal，单位元，2 位）；
-- **迟到账**：迟到 + 准时 = 已应用（迟到只打标记，不改变应用结果）；
-- 四条账在首页、`/snapshot` 与 `manifest.json` 的 `reconcile` 中同时出现，任一条不平会显式为「不平」。
+- **迟到账**：迟到 + 准时 = 已应用（迟到只打标记，不改变应用结果；暂缓不进这条账）；
+- **落库账**（`/audit`）：已落库事件行 = 原始行；按已落库事件重算的快照与已落库快照逐键相等；
+- 前四条账在首页、`/snapshot` 与 `manifest.json` 的 `reconcile` 中同时出现，任一条不平会显式为「不平」；
+  落库账在 `/audit` 与 `/api/audit` 中单独给出。
 
-样例数据的四账：行 42 = 27 + 2 + 3 + 10；键 19 = 18 + 1；快照 18 = 16 活跃 + 2 墓碑；
+样例数据的四账：行 42 = 27 + 2 + 3 + 10 + 0；键 19 = 18 + 1；快照 18 = 16 活跃 + 2 墓碑；
 金额 1552.51 + 200.00 + 0.00 = 1752.51。
 
 ## 反例与不变量
@@ -61,14 +73,20 @@
   - `tests/test_m3_dedup.py::test_conflict_beats_duplicate`（顺序覆盖会把它判成 1 冲突 + 1 重复）；
   - `tests/test_m3_dedup.py::test_low_version_before_delete_still_applies`（把「删除前的低版本」
     一律当复活，会丢掉 1001 的 v1/v2，快照金额少 120.50）；
-  - `tests/test_m6_batches.py::test_stale_input_rejected`（后写覆盖会让水位从 08:52 退回 06:00）。
+  - `tests/test_m6_batches.py::test_stale_input_rejected`（后写覆盖会让水位从 08:52 退回 06:00）；
+  - `tests/test_m8_audit.py::test_all_held_keeps_official_snapshot`（不做发布裁决会用空快照覆盖
+    已发布内容）；
+  - `tests/test_m8_audit.py::test_rebuild_refuses_and_keeps_old_snapshot`（不做落库核对会把损失
+    记录的快照「重算」成看起来正常的新版本）。
 - 不变量：
   - `tests/test_invariants.py::test_row_accounting_identity`（行账守恒）；
   - `tests/test_invariants.py::test_key_accounting_identity`（键账守恒）；
   - `tests/test_invariants.py::test_amount_conservation_is_exact`（金额守恒，Decimal 精确）；
   - `tests/test_invariants.py::test_idempotent_rerun_keeps_rows_and_totals`（幂等重跑）；
   - `tests/test_m4_watermark.py::test_watermark_monotonic`（水位单调）；
-  - `tests/test_m5_snapshot.py::test_rebuild_is_idempotent`（物化可重复）。
+  - `tests/test_m5_snapshot.py::test_rebuild_is_idempotent`（物化可重复）；
+  - `tests/test_m8_audit.py::test_same_input_same_reference_replays`（同参考时刻重跑幂等）；
+  - `tests/test_m8_audit.py::test_audit_detects_missing_snapshot_rows`（落库账能抓到丢行）。
 
 ## 已知不覆盖
 
@@ -77,3 +95,5 @@
   状态一起纳入，属于下一期。
 - 事务边界未建模：同一事务的多条变更不保证原子可见。
 - 中文数字、货币符号（`￥`）不在金额归一范围内，遇到直接按类型错误隔离。
+- 时钟保护只挡「超前」方向，且参考时刻来自运行参数或墙钟，不自动探测源库时区；
+  被暂缓的记录需要参考追上后重新采信，不会后台自动回填。

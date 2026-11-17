@@ -101,6 +101,22 @@
   opacity: 0.55;
 }
 
+/* 暂缓：空心描边竖条，与「已应用/迟到」的实心条区分 */
+.tl-event.is-held {
+  bottom: 17px;
+  width: 3px;
+  height: 23px;
+  background: transparent;
+  border: 1px solid var(--bad);
+  opacity: 0.9;
+}
+
+.tl-legend i.is-held {
+  width: 3px;
+  background: transparent;
+  border: 1px solid var(--bad);
+}
+
 .tl-mark {
   position: absolute;
   top: 4px;
@@ -248,7 +264,12 @@ table.grid tr.is-dim td {
 
 .state-duplicate,
 .state-warn,
-.state-pending {
+.state-pending,
+.state-held {
+  color: var(--warn);
+}
+
+.hint.is-warn {
   color: var(--warn);
 }
 

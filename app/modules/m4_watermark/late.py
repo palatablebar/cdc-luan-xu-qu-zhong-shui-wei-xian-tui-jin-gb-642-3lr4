@@ -60,6 +60,16 @@ def window_table(window_minutes: int) -> list[dict]:
     ]
 
 
+def clock_table(window_minutes: int, tolerance_minutes: int) -> list[dict]:
+    """时钟保护口径：单独一张表，避免和迟到窗口混为一谈。"""
+    return [
+        {"name": "参考时刻", "expr": "本次运行的参考时钟（可用参数固定复算）", "side": "标量"},
+        {"name": "时钟容差", "expr": f"参考 + {tolerance_minutes} 分钟", "side": "上限"},
+        {"name": "暂缓", "expr": "event_time > 参考 + 容差 → 不进水位/快照", "side": "整条"},
+        {"name": "放行", "expr": "参考追上后用新参考重新采信", "side": "新批次"},
+    ]
+
+
 def behind_text(seconds: int) -> str:
     if seconds <= 0:
         return "—"

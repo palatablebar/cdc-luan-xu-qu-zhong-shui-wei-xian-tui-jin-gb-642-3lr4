@@ -37,6 +37,12 @@ class StaleBatch(Conflict):
     code = "C_STALE_BATCH"
 
 
+class RecoveryIncomplete(Conflict):
+    """落库结果与已采信内容不一致：拒绝覆盖旧快照，交由核对页暴露差异。"""
+
+    code = "E_RECOVERY_MISMATCH"
+
+
 def install_handlers(app) -> None:
     from fastapi import Request
     from fastapi.responses import JSONResponse

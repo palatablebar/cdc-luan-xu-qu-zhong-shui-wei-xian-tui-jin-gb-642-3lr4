@@ -12,6 +12,17 @@
       <a class="btn" href="/api/export/snapshot.json">导出 JSON</a>
       <span class="hint" id="snapshot-hint">同一 as_of 重算行数不变</span>
     </div>
+    {% if stale_attempt %}
+    <p class="hint is-bad" style="margin-top:8px">
+      最近一次尝试 {{ attempt.batch_id }}（{{ attempt.status | status }}）不是正式批次：
+      下列快照仍是正式版本 {{ official.batch_id if official else '—' }}，重算会被拒绝。
+    </p>
+    {% elif held_count %}
+    <p class="hint" style="margin-top:8px">
+      本批有 {{ held_count }} 条时间超前被挡下，未进快照；详情见
+      <a href="/audit">核对</a>。
+    </p>
+    {% endif %}
   </div>
 </section>
 

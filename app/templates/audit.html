@@ -1,0 +1,119 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+  <div class="panel-head">
+    <h1>发布核对</h1>
+    <p class="panel-sub">参考 {{ overview.reference_utc | localdt }} · 容差 {{ overview.tolerance_minutes }} 分钟</p>
+  </div>
+  <div class="panel-body">
+    <dl class="kv">
+      <dt>裁决</dt><dd><span class="balance {% if overview.publish.state != 'published' %}is-bad{% endif %}">{{ overview.publish.label }}</span> · {{ overview.publish.note }}</dd>
+      <dt>正式快照</dt><dd>{{ overview.official.batch_id if overview.official else '—' }}{% if overview.official %} · 水位 {{ overview.official.watermark_utc | localdt }}{% endif %}</dd>
+      <dt>本次尝试</dt><dd>{{ overview.attempt.batch_id if overview.attempt else '—' }}{% if overview.attempt %} · {{ overview.attempt.status | status }}{% endif %}</dd>
+      <dt>时钟保护</dt><dd>event_time &gt; {{ overview.horizon_utc | localdt }} 的记录整条暂缓</dd>
+    </dl>
+    <div class="hint" style="margin-top:8px">
+      暂缓记录不进正式水位、不进正式快照；参考时钟追上后重新采信即可放行（不会重复入库）。
+    </div>
+  </div>
+</section>
+
+<div class="split">
+  <aside class="rail" aria-label="核对计数">
+    <dl>
+      <div class="row"><dt class="key">被挡下</dt><dd class="value is-bad">{{ overview.held_count | num }}</dd></div>
+      <div class="row"><dt class="key">已可放行</dt><dd class="value is-ok">{{ overview.releasable_count | num }}</dd></div>
+      <div class="row"><dt class="key">正式键</dt><dd class="value">{{ (overview.audit.snapshot.right if overview.audit else 0) | num }}</dd></div>
+      <div class="row"><dt class="key">落库核对</dt><dd class="value {% if overview.audit and overview.audit.consistent %}is-ok{% else %}is-bad{% endif %}">{{ "一致" if overview.audit and overview.audit.consistent else "不一致" }}</dd></div>
+    </dl>
+  </aside>
+
+  <div class="stack">
+    <section class="panel">
+      <div class="panel-head">
+        <h2>被挡下的记录</h2>
+        <p class="panel-sub">{{ overview.held_count }} 条 · 原因码 W_FUTURE_HELD</p>
+      </div>
+      <div class="panel-body tight">
+        <div class="table-wrap">
+          <table class="grid" data-sortable>
+            <thead>
+              <tr><th>行号引用</th><th>键</th><th class="num">版本</th><th>操作</th><th>事件时间(UTC)</th><th>原始时间</th><th class="num">超前</th><th>原因码</th><th>明细</th><th>状态</th></tr>
+            </thead>
+            <tbody>
+              {% for row in overview.held %}
+              <tr>
+                <td class="mono nowrap">{{ row.row_ref }}</td>
+                <td class="mono">{{ row.table }}/{{ row.pk }}</td>
+                <td class="num">{{ row.version }}</td>
+                <td>{{ row.op }}</td>
+                <td class="mono nowrap">{{ row.event_time | localdt }}</td>
+                <td class="mono nowrap">{{ row.event_time_raw or '—' }}</td>
+                <td class="num">{{ row.skew_text }}</td>
+                <td class="nowrap"><code class="code is-warn">{{ row.reason_code }}</code></td>
+                <td class="ellipsis" title="{{ row.detail }}">{{ row.detail }}</td>
+                <td>{% if row.releasable %}<span class="state state-applied">可放行</span>{% else %}<span class="state state-pending">暂缓</span>{% endif %}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% if not overview.held %}<p class="empty">没有被挡下的记录。</p>{% endif %}
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>仍可发布</h2>
+        <p class="panel-sub">{% if overview.publish.state == 'published' %}正常数据已随本批发布{% else %}本批未发布，正式快照保持上一版{% endif %}</p>
+      </div>
+      <div class="panel-body">
+        <div class="table-wrap">
+          <table class="grid">
+            <thead><tr><th>账</th><th>左</th><th class="num">值</th><th>右</th><th class="num">值</th><th>结论</th></tr></thead>
+            <tbody>
+              {% if overview.audit %}
+              <tr>
+                <td>证据行</td>
+                <td>已落库事件行</td>
+                <td class="num">{{ overview.audit.row_account.left | num }}</td>
+                <td>原始行</td>
+                <td class="num">{{ overview.audit.row_account.right | num }}</td>
+                <td><span class="balance {% if not overview.audit.row_account.ok %}is-bad{% endif %}">{{ "平" if overview.audit.row_account.ok else "不平" }}</span></td>
+              </tr>
+              <tr>
+                <td>快照</td>
+                <td>按已落库事件重算</td>
+                <td class="num">{{ overview.audit.snapshot.left | num }}</td>
+                <td>已落库快照</td>
+                <td class="num">{{ overview.audit.snapshot.right | num }}</td>
+                <td><span class="balance {% if not overview.audit.snapshot.ok %}is-bad{% endif %}">{{ "平" if overview.audit.snapshot.ok else "不平" }}</span></td>
+              </tr>
+              {% for row in window_rows %}
+              <tr class="is-dim"><td>{{ row.name }}</td><td colspan="4" class="mono">{{ row.expr }}</td><td>{{ row.side }}</td></tr>
+              {% endfor %}
+              {% else %}
+              <tr><td colspan="6" class="empty">还没有正式快照。</td></tr>
+              {% endif %}
+            </tbody>
+          </table>
+        </div>
+        {% if overview.audit and not overview.audit.consistent %}
+        <div class="panel-body">
+          <p class="hint is-bad">落库校验不一致（{{ overview.audit.code }}）：恢复中断可能丢失记录。缺失 {{ overview.audit.snapshot.missing_count }} 键、多出 {{ overview.audit.snapshot.extra_count }} 键、变更 {{ overview.audit.snapshot.changed_count }} 键；重算已被拒绝，旧正式快照保留。</p>
+          {% if overview.audit.snapshot.missing %}
+          <p class="mono hint">缺失：{{ overview.audit.snapshot.missing | join(", ") }}</p>
+          {% endif %}
+          {% if overview.audit.snapshot.extra %}
+          <p class="mono hint">多出：{{ overview.audit.snapshot.extra | join(", ") }}</p>
+          {% endif %}
+          {% for row in overview.audit.snapshot.changed %}
+          <p class="mono hint">{{ row.key }}：{{ row.diff }}</p>
+          {% endfor %}
+        </div>
+        {% endif %}
+      </div>
+    </section>
+  </div>
+</div>
+{% endblock %}

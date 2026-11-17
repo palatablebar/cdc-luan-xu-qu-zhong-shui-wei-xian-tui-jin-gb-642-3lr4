@@ -1,9 +1,38 @@
 {% extends "base.html" %}
 {% block content %}
+{% if batch and not attempted_published %}
+<section class="panel">
+  <div class="panel-head">
+    <h2>本批未发布</h2>
+    <p class="panel-sub">{{ batch.status | status }}</p>
+  </div>
+  <div class="panel-body">
+    <p class="hint is-bad">
+      最近一次尝试 {{ batch.batch_id }} 没有发布（全部暂缓或失败）；下列刻度只是本批证据，
+      正式水位仍是 {{ official_watermark | localdt }}（{{ official.batch_id if official else '—' }}）。
+    </p>
+  </div>
+</section>
+{% endif %}
+{% if reference and reference.held %}
+<section class="panel">
+  <div class="panel-head">
+    <h2>时钟保护</h2>
+    <p class="panel-sub">{{ reference.held }} 条被挡下</p>
+  </div>
+  <div class="panel-body">
+    <p class="hint is-warn">
+      参考 {{ reference.reference | localdt }} · 容差 {{ tolerance_minutes }} 分钟。
+      event_time 超过 {{ reference.horizon | localdt }} 的记录整条暂缓：不推进水位、不进正式快照，
+      正常数据不受影响。逐条证据见 <a href="/audit">核对</a>。
+    </p>
+  </div>
+</section>
+{% endif %}
 <section class="panel">
   <div class="panel-head">
     <h1>水位时间轴</h1>
-    <p class="panel-sub">{{ totals.applied | num }} 已应用 · {{ totals.late_events | num }} 迟到</p>
+    <p class="panel-sub">{{ totals.applied | num }} 已应用 · {{ totals.late_events | num }} 迟到{% if totals.held %} · {{ totals.held | num }} 暂缓{% endif %}</p>
   </div>
   <div class="panel-body">
     <div class="actions">
@@ -35,6 +64,7 @@
       <span><i class="is-late"></i>迟到</span>
       <span><i class="is-pending"></i>待定</span>
       <span><i class="is-mark"></i>水位线</span>
+      <span><i class="is-held"></i>暂缓（不进水）</span>
     </div>
   </div>
   <script type="application/json" id="timeline-data">{{ timeline_json | safe }}</script>
@@ -73,7 +103,11 @@
               <tr><td>最大事件时间</td><td class="mono">{{ watermark.max_event_time | localdt }}</td><td>已应用</td></tr>
               <tr><td>迟到条数</td><td class="num">{{ totals.late_events | num }}</td><td>event_time &lt; 水位线</td></tr>
               <tr><td>最晚落后</td><td class="num">{{ totals.max_behind_minutes | num }} 分钟</td><td>迟到窗口 {{ late_window }} 分钟</td></tr>
+              <tr><td>暂缓条数</td><td class="num">{{ totals.held | num }}</td><td>event_time &gt; 参考 + {{ tolerance_minutes }} 分钟</td></tr>
               {% for row in window_rows %}
+              <tr class="is-dim"><td>{{ row.name }}</td><td class="mono">{{ row.expr }}</td><td>{{ row.side }}</td></tr>
+              {% endfor %}
+              {% for row in clock_rows %}
               <tr class="is-dim"><td>{{ row.name }}</td><td class="mono">{{ row.expr }}</td><td>{{ row.side }}</td></tr>
               {% endfor %}
             </tbody>
@@ -166,6 +200,40 @@
         {% if not late_rows %}<p class="empty">没有迟到事件。</p>{% endif %}
       </div>
     </section>
+
+    {% if held_rows %}
+    <section class="panel">
+      <div class="panel-head">
+        <h2>暂缓记录</h2>
+        <p class="panel-sub">{{ held_rows | length }} 条 · 不推进水位</p>
+      </div>
+      <div class="panel-body tight">
+        <div class="table-wrap">
+          <table class="grid" data-sortable>
+            <thead>
+              <tr><th>行号引用</th><th>键</th><th class="num">版本</th><th>事件时间</th><th>原始时间</th><th>原因码</th><th>明细</th></tr>
+            </thead>
+            <tbody>
+              {% for row in held_rows %}
+              <tr>
+                <td class="mono nowrap">{{ row.row_ref }}</td>
+                <td class="mono">{{ row.table }}/{{ row.pk }}</td>
+                <td class="num">{{ row.version }}</td>
+                <td class="mono nowrap">{{ row.event_time | localdt }}</td>
+                <td class="mono nowrap">{{ row.event_time_raw or '—' }}</td>
+                <td class="nowrap"><code class="code is-warn">{{ row.reason_code }}</code></td>
+                <td class="ellipsis" title="{{ row.detail }}">{{ row.detail }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <div class="panel-body">
+          <a class="btn" href="/audit">在核对页看全部证据</a>
+        </div>
+      </div>
+    </section>
+    {% endif %}
   </div>
 </div>
 {% endblock %}

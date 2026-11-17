@@ -28,15 +28,21 @@ def digest_parts(parts: list[str]) -> str:
 def build(*, run_id: str, batch_id: str, batch_key: str, settings, source: str,
           input_digest: str, inputs: list[dict], params: dict, started_at: str,
           finished_at: str, elapsed_ms: int, stages: list[dict], counters: dict,
-          watermark: str, max_event_time: str, reconcile: dict) -> dict:
+          watermark: str, max_event_time: str, reconcile: dict,
+          reference_utc: str = "", future_horizon_utc: str = "",
+          status: str = "done") -> dict:
     """清单是一份可独立复核的证据：输入摘要 + 参数 + 计数 + 对账身份。"""
     return {
         "run_id": run_id,
         "batch_id": batch_id,
         "batch_key": batch_key,
         "source": source,
+        "status": status,
         "rule_version": settings.rule_version,
         "late_window_minutes": settings.late_window_minutes,
+        "future_tolerance_minutes": settings.future_tolerance_minutes,
+        "reference_utc": reference_utc,
+        "future_horizon_utc": future_horizon_utc,
         "watermark_utc": watermark,
         "max_event_time_utc": max_event_time,
         "timezone": "入库 UTC，页面按 Asia/Shanghai(+08:00)",

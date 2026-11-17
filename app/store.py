@@ -117,13 +117,35 @@ class Store:
             "ORDER BY created_at LIMIT 1", (batch_key,))
         return rows[0] if rows else None
 
+    def find_replayable_by_key(self, batch_key: str) -> dict | None:
+        """可幂等复用的批次：已发布，或本批全部暂缓/空结果（证据完整、结果可复算）。"""
+        rows = self._all(
+            "SELECT * FROM batches WHERE batch_key=? "
+            "AND status IN ('done','held_only','empty_only') "
+            "ORDER BY created_at LIMIT 1", (batch_key,))
+        return rows[0] if rows else None
+
     def latest_batch(self, status: str = "done") -> dict | None:
+        """指定状态的最新批次（默认已发布）；没有该状态才回退到任意最新批次。"""
         rows = self._all(
             "SELECT * FROM batches WHERE status=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
             (status,))
         if not rows:
             rows = self._all("SELECT * FROM batches ORDER BY created_at DESC, rowid DESC LIMIT 1",
                              ())
+        return rows[0] if rows else None
+
+    def latest_any(self) -> dict | None:
+        """最新一次尝试（含暂缓/失败）：核对页用来展示被挡下的记录。"""
+        rows = self._all(
+            "SELECT * FROM batches ORDER BY created_at DESC, rowid DESC LIMIT 1", ())
+        return rows[0] if rows else None
+
+    def latest_published(self) -> dict | None:
+        """最新一版正式快照所属批次；暂缓与失败批次不参与。"""
+        rows = self._all(
+            "SELECT * FROM batches WHERE status='done' "
+            "ORDER BY created_at DESC, rowid DESC LIMIT 1", ())
         return rows[0] if rows else None
 
     def list_batches(self, limit: int = 30) -> list[dict]:
@@ -238,8 +260,16 @@ class Store:
                              (batch_id, key, str(value)))
 
     def save_attempt(self, *, batch: dict, inputs: list[dict], note: str = "") -> None:
-        """失败尝试：只写批次与输入，不动任何已存在批次的结果行。"""
+        """失败尝试：只写批次与输入，不动任何已存在批次的结果行。
+
+        `done` 批次不降级：续跑失败时，上一版正式快照的来源批次必须保持原状态，
+        否则「正式快照」会指向一个失败批次。
+        """
         with self.connect() as conn:
+            existing = conn.execute("SELECT status FROM batches WHERE batch_id=?",
+                                    (batch["batch_id"],)).fetchone()
+            if existing is not None and existing["status"] == "done":
+                return
             conn.execute(
                 """INSERT INTO batches (batch_id,batch_key,run_id,source,status,created_at,
                         finished_at,input_digest,watermark_utc,max_event_time,params_json,

@@ -25,11 +25,22 @@ def normalize_params(params: dict | None) -> dict:
     return clean
 
 
-def batch_key(input_digest: str, rule_version: str, params: dict | None = None) -> str:
+def batch_key(input_digest: str, rule_version: str, params: dict | None = None,
+              rule_params: dict | None = None,
+              hold_signature: list[str] | None = None) -> str:
+    """批次键 = 输入摘要 + 规则版本 + 参数 + 规则参数 + 暂缓集合签名。
+
+    - 规则参数进键：迟到窗口或未来容差变了，同一输入也要按新规则重算；
+    - 暂缓集合签名进键：参考时钟追上、有记录被放行时，结果确实不同，必须算新
+      批次；而没有记录被放行时签名不变，重跑仍命中同一批次（幂等、不重复）；
+    - 参考时刻本身**不进键**：否则每次重跑都会因为墙钟不同而新建批次。
+    """
     body = "|".join([
         input_digest,
         rule_version,
         json.dumps(normalize_params(params), sort_keys=True, ensure_ascii=False),
+        json.dumps(normalize_params(rule_params), sort_keys=True, ensure_ascii=False),
+        json.dumps(sorted(hold_signature or []), ensure_ascii=False),
     ])
     return hashlib.sha256(body.encode("utf-8")).hexdigest()[:10]
 
